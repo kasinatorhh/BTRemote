@@ -41,4 +41,12 @@ typedef struct __attribute__((packed)) {
   uint8_t LRC; //Line check Character. Equals byte wise-sum of message before.
 } Message_T;
 extern Message_T Msg;
+
+bool MessageValid(){
+  uint8_t LRC=0;
+  for (int i = 0;i<sizeof(Msg)-1;i++){
+    LRC += ((uint8_t*)&Msg)[i];
+  }
+  return LRC==Msg.LRC;
+}
 #endif

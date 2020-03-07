@@ -25,7 +25,7 @@
 #define BT_EN 2
 #define JOYSWITCH 3
 #include <Wire.h>
-//#include <Adafruit_GFX.h>
+#include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "i2c_MMA8451.h"
 
