@@ -15,7 +15,7 @@
 #include <SoftwareSerial.h>
 #include "Spider_Hardware.h"
 #include "MoveCore.h"
-
+#include "BTSerial.h"
 
 /**********************************
  * Global Variables / Class inits
@@ -24,10 +24,10 @@
 #define BT_RX 13
 #define BT_EN 2
 #define JOYSWITCH 3
-#include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
+//#include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "i2c_MMA8451.h"
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
@@ -79,14 +79,18 @@ EEPROM_T * NVM=0;
 /**********************************
  * Global Variables / Class inits
  *********************************/
+static Message_T Msg;
 
-typedef struct {
-  int16_t X;
-  int16_t Y;
-  int16_t Z;
-} SENSOR_T;
-SENSOR_T JoyRef;
-SENSOR_T Joy;
+int16_t JoyRefX;
+int16_t JoyRefY;
+
+MMA8451 mma8451; 
+static long int Time;
+
+#define UPDATEINTERVAL 50
+#define NUMREADINGS 3
+static int16_t Readings[5][NUMREADINGS+1]={0};//X,Y,Z,JoyX,JoyY
+static uint8_t ReadIndex;
 
 void setup() {
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
@@ -94,57 +98,121 @@ void setup() {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;); // Don't proceed, loop forever
   }
-  testdrawchar();      // Draw characters of the default font
-  JoyRef.X=analogRead(A6);
-  JoyRef.Y=analogRead(A7);
+  ShowSplash();
+  analogReference(DEFAULT);
+  delay(150);
+  for (int i=0;i<NUMREADINGS*2;i++){
+    ComposeMessage();
+  }
+  JoyRefX=Msg.JoyX;
+  JoyRefY=Msg.JoyY;
   pinMode(BT_EN,OUTPUT);  
-  pinMode(JOYSWITCH,INPUT_PULLUP);
+  pinMode(JOYSWITCH,INPUT_PULLUP);   
   // Open serial communications and wait for port to open:
   Serial.begin(UARTFAST);
   BSerial.begin(BAUDBTCOM);
   BSerial.setTimeout(2);
   Serial.setTimeout(2);
   Serial.println(F("Welcome to Bluetooth Remote!"));
-  if (UpdatesEnabled()){
-    Serial.print(F("EEPROM Writes Enabled. Send PROTECT to switch off\n"));
-  }else{
-    PrintUpdateMessage();
-  }
+//  if (UpdatesEnabled()){
+//    Serial.print(F("EEPROM Writes Enabled. Send PROTECT to switch off\n"));
+//  }else{
+//    PrintUpdateMessage();
+//  }
 //  FlexiTimer2::start();
 //  PrintHelp();
   Serial.print("Sketch:   ");   Serial.println(F(__FILE__));
   Serial.print("Uploaded: ");   Serial.println(F(__DATE__));
+  if (mma8451.initialize()){
+    Serial.println(F("MMA8451 Sensor found!"));
+    display.println(F("MMA8451 Sensor found!"));
+    display.display();
+  }
+  delay(2000);
   Serial.println(F("Ready for Command:"));
+  Time=millis();
 }
 
-#define MAGICEEPROMUPDATE_ENABLED 0x1337
-bool UpdatesEnabled(){
-  uint16_t Magic;
-  EEPROM.get((int)&NVM->EEPROMUpdatesDisabled, Magic);
-  return Magic==MAGICEEPROMUPDATE_ENABLED;
-}
-void EnableUpdates(){
-    EEPROM.put((int)&NVM->EEPROMUpdatesDisabled,(uint16_t)MAGICEEPROMUPDATE_ENABLED);
-}
-void DisableUpdates(){
-    EEPROM.put((int)&NVM->EEPROMUpdatesDisabled,(uint16_t)!MAGICEEPROMUPDATE_ENABLED);
-}
-void PrintUpdateMessage(){
-    Serial.println(F("Updates are Disabled, send UNPROTECT to activate"));
+void loop() {
+  char input[INPUT_SIZE+1];
+  delay(millis()-Time+UPDATEINTERVAL);
+  for (int i = 0; i < sizeof(input);i++){
+    input[i]=0;
+  }
+  ComposeMessage();
+  SendMessage();
+  Time=millis();
+  MessageToDisplay();
+  delay(UPDATEINTERVAL/2);
+  byte rxlen=ReceiveUSBSerial(input);
+  //others
+  if (rxlen>0){
+    HandleUSBSerial(input, rxlen);
+  }
+  String RX = "Timeout";
+  if (BSerial.available()){
+    delay(2);
+    RX = BSerial.readString();
+  }
+  display.print(RX);
+  display.display();
 }
 
-void printHEX(uint8_t len, char *input){
-    Serial.print(F("Input Data:"));
-    for (uint8_t i=0;i<len;i++){
-      Serial.write(input[i]);
+byte ReceiveUSBSerial(char * input){
+  byte rxlen=0;
+  while(Serial.available()){
+    delay(2);
+    uint8_t rc=Serial.read();
+    if (rc==' '||(rc>43)||(rc<58)||(rc>64)||(rc<123)) //valid characters: a-zA-Z,.-0-9
+    { 
+      input[rxlen++]=rc;
+    }else{
+      input[rxlen]=0;
+      Serial.end();
+      break;
     }
-    Serial.print(F("\nin Hex:"));
-    for (uint8_t i=0;i<len;i++){
-      Serial.write(' ');
-      if (input[i]<16) Serial.print('0');
-      Serial.print(input[i],HEX);
-    }
-    Serial.write('\n');
+  }
+//  if (rxlen>0){
+//    printHEX(rxlen,input);
+//  }
+  return rxlen;
+}
+
+void HandleUSBSerial(char * input, byte rxlen){
+  if (rxlen==0)return;
+  switch (input[0]){
+    case 'A': USB_BT_Transparent(BT_CONFIG,BAUDBTCONF); break;
+    case 'a': USB_BT_Transparent(BT_COM,BAUDBTCOM); break;
+    case 'S': USB_BT_Transparent(BT_CONFIG,9600); break;
+    case 'X': break;
+//    case 'U': if ((input[1]=='N')&&(input[2]=='P')&&(input[3]=='R')&&(input[4]=='O')&&(input[5]=='T')){
+//                Serial.println(input);
+//                EnableUpdates();
+//              };
+//              break;
+//    case 'P': if ((input[1]=='R')&&(input[2]=='O')&&(input[3]=='T')&&(input[4]=='E')&&(input[5]=='C')&&(input[6]=='T')){
+//                Serial.println(input);
+//                DisableUpdates();};break;
+//    case '^': asm volatile ("  jmp 0");break;
+  }
+}
+
+void ShowSplash(){
+  display.clearDisplay();
+  display.setTextSize(2);      // Normal 1:1 pixel scale
+  display.setTextColor(SSD1306_WHITE); // Draw white text
+  display.setCursor(0, 0);     // Start at top-left corner
+  display.cp437(true);         // Use full 256 char 'Code Page 437' font  
+  display.println(F("BTRemote"));
+  display.setTextSize(1);      // Normal 1:1 pixel scale
+  display.println(F(__DATE__));
+  display.display();
+}
+
+void SendMessage(){
+  for (int i = 0;i<sizeof(Msg);i++){
+    BSerial.write (((uint8_t*)&Msg)[i]);
+  }
 }
 
 void USB_BT_Transparent(uint8_t Mode, long Speed){
@@ -177,186 +245,93 @@ void USB_BT_Transparent(uint8_t Mode, long Speed){
   Serial.println(F("Transparent Mode terminated"));
 }
 
-void loop() {
-  char input[INPUT_SIZE+1];
-  char cmd;
-  uint8_t ServoID;
-  int8_t RX_X;
-  int8_t RX_Y;
-  uint16_t Value;
-  String inp;
-  bool Fast;
+int16_t MovingAverage(int16_t * Readings, int16_t Value){
+  Readings[NUMREADINGS]-=Readings[ReadIndex];//substract oldest
+  Readings[ReadIndex]=Value;
+  Readings[NUMREADINGS]+=Readings[ReadIndex];
+  return Readings[NUMREADINGS]/NUMREADINGS;
+}
 
-  for (int i = 0; i < sizeof(input);i++){
-    input[i]=0;
-  }
+void ComposeMessage(){
+  Msg.Ident='%';
+  Msg.JoyX=MovingAverage(Readings[3],analogRead(A6)-JoyRefX);
+  Msg.JoyY=MovingAverage(Readings[4],analogRead(A7)-JoyRefY);
+  long int S=sq((long int)Msg.JoyX)+sq((long int)Msg.JoyY);//Radius 
+  if (S>261121){S=261121;}//511^2
+  Msg.JoySpeed=sqrt(S);
+  Msg.JoyAngle=atan2(Msg.JoyX,Msg.JoyY)*5729.779;//1/100 Grad
+  if (Msg.JoySpeed<3) Msg.JoyAngle=0;//filter LSB Angle changes
+  int16_t xyz_g[3]; 
+  mma8451.getMeasurement(xyz_g);
+  Msg.GyroX=MovingAverage(Readings[0],xyz_g[0]);
+  Msg.GyroY=MovingAverage(Readings[1],xyz_g[1]);
+  Msg.GyroZ=MovingAverage(Readings[2],xyz_g[2]);
+  long int G=sqrt((long int)Msg.GyroX*(long int)Msg.GyroX+(long int)Msg.GyroY*(long int)Msg.GyroY+(long int)Msg.GyroZ*(long int)Msg.GyroZ);
+  Msg.GyroG=G;
+  Msg.Switches=digitalRead(3);
 
-  Joy.X=analogRead(A6)-JoyRef.X;
-  Joy.Y=analogRead(A7)-JoyRef.Y;
+  ReadIndex++;
+  if (ReadIndex==NUMREADINGS)ReadIndex=0;
   
-  display.clearDisplay();
+  Msg.LRC=0;
+  for (int i = 0;i<sizeof(Msg)-1;i++){
+    uint8_t b = ((uint8_t*)&Msg)[i];
+    Msg.LRC+=b;
+  }
+}
 
+void MessageToDisplay(){
+  display.clearDisplay();
   display.setTextSize(1);      // Normal 1:1 pixel scale
   display.setTextColor(SSD1306_WHITE); // Draw white text
   display.setCursor(0, 0);     // Start at top-left corner
   display.cp437(true);         // Use full 256 char 'Code Page 437' font
 
-  display.print(F("BTRemote "));
-  display.println(F(__DATE__));
-  display.print((int)Joy.X);
-  display.print(F(" "));
-  display.print((int)Joy.Y);
-  display.print(F(" "));
-  display.print(digitalRead(3));
-  display.print(F(" "));
-  display.print(analogRead(A6));
-  display.print(F(" "));
-  display.println(analogRead(A7));
-
-  Fast=((Joy.X>400)||(Joy.X<-400)||(Joy.Y>400)||(Joy.Y<-400));
-  if (Fast)
-    display.print(F("Fast "));
-  if (Joy.Y>60) {
-    display.print(F("Forward"));
-    if (Fast){
-      TransmitWaitReady("FF");
-    }else{
-      TransmitWaitReady("ff");
-      }
-  }
-  if (Joy.Y<-60){
-    display.print(F("Reverse"));
-    if (Fast){
-      TransmitWaitReady("PP");
-    }else{
-      TransmitWaitReady("pp");
-    }
-  }
-  display.print(F(" "));
-  if (Joy.X>100){
-    display.print(F("Right"));
-    if (Fast){
-      TransmitWaitReady("LL");
-    }else{
-      TransmitWaitReady("ll");
-    }
-  }
-  if (Joy.X<-100){
-    display.print(F("Left"));
-    if (Fast){
-      TransmitWaitReady("MM");
-    }else{
-      TransmitWaitReady("mm");
-    }
-  }
-  
-  // Not all the characters will fit on the display. This is normal.
-  // Library will draw what it can and the rest will be clipped.
-//  for(int16_t i=0;  i<256; i++) {
-//    if(i == '\n') display.write(' ');
-//    else          display.write(i);
-//  }
-
-  display.display();
-
-  byte rxlen=0;
-  while(Serial.available()){
-    delay(2);
-    uint8_t rc=Serial.read();
-    if (rc==' '||(rc>43)||(rc<58)||(rc>64)||(rc<123)) //valid characters: a-zA-Z,.-0-9
-    { 
-      input[rxlen++]=rc;
-    }else{
-      input[rxlen]=0;
-      Serial.end();
-      break;
-    }
-  }
-  if (rxlen>0){
-    printHEX(rxlen,input);
-  }
-  //others
-  if (rxlen>0){
-    ServoID=15;
-    Value=65535;
-    char* command = strtok(input, " ;\n");
-    cmd=command[0];
-    char* separator= strtok(NULL,' ');
-    if (separator != NULL) ServoID=atoi(separator);
-    ++separator;
-    Value=atoi(++separator);
-    Serial.print(F("Command:"));Serial.print(cmd);
-    Serial.print(F(",ServoID:"));Serial.print(ServoID);
-    Serial.print(F(",Value:"));Serial.println(Value);
-    switch (cmd){
-      case 'A': USB_BT_Transparent(BT_CONFIG,BAUDBTCONF); break;
-      case 'a': USB_BT_Transparent(BT_COM,BAUDBTCOM); break;
-      case 'S': USB_BT_Transparent(BT_CONFIG,9600); break;
-      case 'X': break;
-      case 'U': if ((input[1]=='N')&&(input[2]=='P')&&(input[3]=='R')&&(input[4]=='O')&&(input[5]=='T')){
-                  Serial.println(input);
-                  EnableUpdates();
-                };
-                break;
-      case 'P': if ((input[1]=='R')&&(input[2]=='O')&&(input[3]=='T')&&(input[4]=='E')&&(input[5]=='C')&&(input[6]=='T')){
-                  Serial.println(input);
-                  DisableUpdates();};break;
-      case '^': asm volatile ("  jmp 0");break;
-    }
-    Serial.println("Done");
-    command = strtok(0, 10);
-  }
+  char Gyro[50];
+  sprintf(Gyro,"X%+5dY%+5dZ%+5d S%d\nx%+4dy%+4d S=%4d\nJ:%+4d^ g:%3d ",
+                Msg.GyroX,Msg.GyroY,Msg.GyroZ,Msg.Switches,
+                Msg.JoyX,Msg.JoyY,Msg.JoySpeed,Msg.JoyAngle/100,Msg.GyroG/111);
+  display.println(Gyro);
+//  sprintf(Gyro,"Grav:%4d TX:",Msg.GyroG);
+//  display.print(Gyro);
+//  displayHEX(sizeof(Msg),(char*)&Msg);
 }
 
-void TransmitWaitReady(String TX){
-  Serial.print(TX);
-  BSerial.print(TX);
-  display.print("TX:");
-  display.print(TX);
-  //Receive some bytes, check if it contains °RY=EndMarker
-  //Timeout after 2000ms
-  unsigned long time;
-  bool EndMarker=false;
-//  time=millis();
-  delay(50);
-//  if (BSerial.available()){//flush intial message
-//    BSerial.read();
-//  }
-//  while(1){
-//    if (BSerial.available())
-//    {
-//      if (BSerial.read()=='°')//end marker candidate
-//        if (BSerial.read()=='R')
-//          if (BSerial.read()=='Y')
-//          {
-//            EndMarker=true;
-//            break;//End marker found from Robot
-//          }
+//void printHEX(uint8_t len, char *input){
+//    Serial.print(F("Input Data:"));
+//    for (uint8_t i=0;i<len;i++){
+//      Serial.write(input[i]);
 //    }
-//    if ((millis()-time)>5000) break;//timeout
-//  }
-//  if (EndMarker){
-//    display.print(F("Ready"));
-//  }else{
-//    display.print(F("Timeout"));
-//  }         
-}
-
-void testdrawchar(void) {
-  display.clearDisplay();
-
-  display.setTextSize(1);      // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE); // Draw white text
-  display.setCursor(0, 0);     // Start at top-left corner
-  display.cp437(true);         // Use full 256 char 'Code Page 437' font
-
-  // Not all the characters will fit on the display. This is normal.
-  // Library will draw what it can and the rest will be clipped.
-  for(int16_t i=0; i<256; i++) {
-    if(i == '\n') display.write(' ');
-    else          display.write(i);
-  }
-
-  display.display();
-  delay(2000);
-}
+//    Serial.print(F("\nin Hex:"));
+//    for (uint8_t i=0;i<len;i++){
+//      Serial.write(' ');
+//      if (input[i]<16) Serial.print('0');
+//      Serial.print(input[i],HEX);
+//    }
+//    Serial.write('\n');
+//}
+//
+//void displayHEX(uint8_t len, char *input){
+//    for (uint8_t i=0;i<len;i++){
+////      display.write('');
+//      if ((uint8_t)input[i]<16) display.print('0');
+//      display.print((uint8_t)input[i],HEX);
+//    }
+//    Serial.write(';');
+//}
+//#define MAGICEEPROMUPDATE_ENABLED 0x1337
+//bool UpdatesEnabled(){
+//  uint16_t Magic;
+//  EEPROM.get((int)&NVM->EEPROMUpdatesDisabled, Magic);
+//  return Magic==MAGICEEPROMUPDATE_ENABLED;
+//}
+//void EnableUpdates(){
+//    EEPROM.put((int)&NVM->EEPROMUpdatesDisabled,(uint16_t)MAGICEEPROMUPDATE_ENABLED);
+//}
+//void DisableUpdates(){
+//    EEPROM.put((int)&NVM->EEPROMUpdatesDisabled,(uint16_t)!MAGICEEPROMUPDATE_ENABLED);
+//}
+//void PrintUpdateMessage(){
+//    Serial.println(F("Updates are Disabled, send UNPROTECT to activate"));
+//}
+//
